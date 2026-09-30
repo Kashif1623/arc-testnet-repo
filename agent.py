@@ -8,39 +8,39 @@ import sqlite3
 import requests
 from flask import Flask, Response, jsonify, request
 
-# =======================================================================
+# ==========================================
 # CONFIGURATION & GLOBAL STATE (TESTNET)
-# =======================================================================
+# ==========================================
 PRIMARY_RPC_ENDPOINTS = [
-    "https://arc-testnet.drpc.org",          
-    "https://rpc.testnet.arc.network"        
+    "https://arc-testnet.drpc.org",
+    "https://rpc.testnet.arc.network"
 ]
 FALLBACK_RPC_ENDPOINTS = [
     "https://testnet.arc.network"
 ]
 
 DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE"
-TELEGRAM_BOT_TOKEN = "8957473691:AAG6BgDwvyejUpEscgs9qcnGT-ddgtvrlEA" 
+TELEGRAM_BOT_TOKEN = "8957473691:AAG6BgDwvyejUpEscgs9qcnGT-ddgtvrIEA"
 TELEGRAM_CHAT_ID = "8822300532"
 
 FAILURE_THRESHOLD = 3
 COOLDOWN_SECONDS = 20
 MAX_DRIFT_THRESHOLD = 8
-SUPER_PATIENT_TIMEOUT = 6   
-GAS_ALERT_THRESHOLD_GWEI = 150.0  
-HIGH_LATENCY_THRESHOLD_MS = 500 
+SUPER_PATIENT_TIMEOUT = 6
+GAS_ALERT_THRESHOLD_GWEI = 150.0
+HIGH_LATENCY_THRESHOLD_MS = 500
 
 DB_FILE = "arc_testnet_sla.db"
 ACTIVE_RPC_POOL = list(PRIMARY_RPC_ENDPOINTS)
 rpc_status = {url: {"failures": 0, "circuit_broken_until": 0} for url in (PRIMARY_RPC_ENDPOINTS + FALLBACK_RPC_ENDPOINTS)}
-global_node_data = {}  
+global_node_data = {}
 
 app = Flask(__name__)
 log_queue = queue.Queue(maxsize=200)
 
-# =======================================================================
+# ==========================================
 # SQLITE DATABASE SETUP (SLA & UPTIME)
-# =======================================================================
+# ==========================================
 def init_db():
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -56,248 +56,169 @@ def log_to_db(url, status, latency=0, block=0):
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         c.execute("INSERT INTO uptime_logs VALUES (?, ?, ?, ?, ?)", (timestamp, url, status, latency, block))
         conn.commit()
         conn.close()
     except Exception:
         pass
 
-# =======================================================================
-# CORE LOGGING & ALERTS
-# =======================================================================
-def emit_log(message):
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-    formatted_msg = f"{timestamp} | {message}\n"
+init_db()
+
+def log_msg(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"{timestamp} | {message}"
+    print(formatted)
     try:
-        log_queue.put_nowait(formatted_msg)
-    except queue.Full:
-        try:
+        if log_queue.full():
             log_queue.get_nowait()
-            log_queue.put_nowait(formatted_msg)
-        except Exception:
-            pass
-
-async def send_discord_alert(session, alert_title, details):
-    if DISCORD_WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE": return
-    payload = {"username": "Arc Testnet Sentinel", "content": f"🚨 **[{alert_title}]**\n{details}\n⏰ **Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}"}
-    try: await session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-    except Exception: pass
-
-def send_telegram_message(text):
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE": return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload, timeout=5)
-    except Exception: pass
-
-# =======================================================================
-# ASYNC NETWORK MONITORING ENGINE
-# =======================================================================
-async def fetch_json(session, url, payload):
-    start_time = time.time()
-    try:
-        async with session.post(url, json=payload, timeout=SUPER_PATIENT_TIMEOUT) as response:
-            if response.status == 200:
-                data = await response.json()
-                latency = int((time.time() - start_time) * 1000)
-                return data, latency
-    except Exception:
-        pass
-    return None, 0
-
-async def check_rpc_with_circuit_breaker(session, url):
-    current_time = time.time()
-    if current_time < rpc_status[url]["circuit_broken_until"]: return None
-
-    block_payload = {"jsonrpc": "2.0", "method": "eth_getBlockByNumber", "params": ["latest", False], "id": 1}
-    gas_payload = {"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 2}
-    
-    try:
-        res_block_tuple, res_gas_tuple = await asyncio.gather(
-            fetch_json(session, url, block_payload),
-            fetch_json(session, url, gas_payload),
-            return_exceptions=True
-        )
-        
-        if isinstance(res_block_tuple, tuple) and isinstance(res_gas_tuple, tuple):
-            res_block, latency_block = res_block_tuple
-            res_gas, _ = res_gas_tuple
-            
-            if res_block and res_gas:
-                block_data = res_block.get("result")
-                gas_hex = res_gas.get("result")
-                
-                if block_data and "number" in block_data and gas_hex:
-                    rpc_status[url]["failures"] = 0  
-                    gas_gwei = round(int(gas_hex, 16) / 10**9, 2) 
-                    height = int(block_data["number"], 16)
-                    
-                    log_to_db(url, "ONLINE", latency_block, height)
-                    return {"url": url, "height": height, "hash": block_data["hash"], "gas": gas_gwei, "latency": latency_block}
+        log_queue.put_nowait(formatted)
     except Exception:
         pass
 
-    rpc_status[url]["failures"] += 1
-    log_to_db(url, "OFFLINE", 0, 0)
-    
-    if rpc_status[url]["failures"] >= FAILURE_THRESHOLD:
-        rpc_status[url]["circuit_broken_until"] = current_time + COOLDOWN_SECONDS
-        emit_log(f"🔴 [CRITICAL] Testnet Node isolated: {url}")
-        await send_discord_alert(session, "NODE_CRASH_ALERT", f"🔴 Testnet Node Down: {url}")
-    return None
+# ==========================================
+# TELEGRAM NOTIFICATIONS & COMMANDS
+# ==========================================
+def send_telegram_alert(message):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        log_msg(f"[!] Telegram API Error: {e}")
 
-async def monitor_network():
-    global ACTIVE_RPC_POOL, global_node_data
-    emit_log("INFO | Testnet Sentinel Core & SQLite initialized successfully.")
-    
-    connector = aiohttp.TCPConnector(limit_per_host=10, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        while True:
+def send_custom_message(chat_id, message):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        log_msg(f"[!] Telegram Custom Message Error: {e}")
+
+def get_status_report():
+    report = "⚡ *ARC Testnet Node Status Report*\n\n"
+    for url, data in global_node_data.items():
+        status = data.get("status", "UNKNOWN")
+        block = data.get("block", 0)
+        latency = data.get("latency", 0)
+        emoji = "🟢" if status == "ONLINE" else "🔴"
+        report += f"{emoji} `{url}`\n   • Status: *{status}*\n   • Block: `{block}`\n   • Latency: `{latency}ms`\n\n"
+    if not global_node_data:
+        report += "Initializing nodes data, please wait a few seconds..."
+    return report
+
+# ==========================================
+# BACKGROUND MONITORING WORKER
+# ==========================================
+def monitor_worker():
+    log_msg("Testnet Sentinel Core & SQLite initialized successfully.")
+    while True:
+        for url in ACTIVE_RPC_POOL:
+            start_time = time.time()
+            block_height = 0
+            latency = 0
             try:
-                tasks = [check_rpc_with_circuit_breaker(session, url) for url in ACTIVE_RPC_POOL]
-                results = await asyncio.gather(*tasks)
-                
-                latest_data = {res["url"]: res for res in results if res is not None}
-                global_node_data = latest_data 
-                
-                if not latest_data:
-                    emit_log("⚠️ [FATAL] All Testnet nodes offline. Engaging failover array.")
-                    ACTIVE_RPC_POOL = list(PRIMARY_RPC_ENDPOINTS + FALLBACK_RPC_ENDPOINTS)
-                    await asyncio.sleep(5)
-                    continue
-                
-                for url, data in latest_data.items():
-                    perf_indicator = "🟢" if data['latency'] < HIGH_LATENCY_THRESHOLD_MS else "🟠"
-                    emit_log(f"INFO | {perf_indicator} [ONLINE] {url} | Block: {data['height']} | Ping: {data['latency']}ms | Gas: {data['gas']} Gwei")
-                
-                await asyncio.sleep(15)
-                
+                payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+                resp = requests.post(url, json=payload, timeout=SUPER_PATIENT_TIMEOUT)
+                latency = int((time.time() - start_time) * 1000)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "result" in data:
+                        block_height = int(data["result"], 16)
+                        log_msg(f"🟢 [ONLINE] {url} | Block: {block_height} | Ping: {latency}ms")
+                        rpc_status[url]["failures"] = 0
+                        global_node_data[url] = {"status": "ONLINE", "latency": latency, "block": block_height}
+                        log_to_db(url, "ONLINE", latency, block_height)
+                    else:
+                        raise ValueError("Invalid JSON-RPC response")
+                else:
+                    raise Exception(f"HTTP Status {resp.status_code}")
             except Exception as e:
-                emit_log(f"🔴 [ERROR] Loop exception: {str(e)}")
-                await asyncio.sleep(5)
+                latency = int((time.time() - start_time) * 1000)
+                log_msg(f"🔴 [OFFLINE] {url} | Error: {e}")
+                rpc_status[url]["failures"] += 1
+                global_node_data[url] = {"status": "OFFLINE", "latency": latency, "block": 0}
+                log_to_db(url, "OFFLINE", latency, 0)
+                if rpc_status[url]["failures"] >= FAILURE_THRESHOLD:
+                    send_telegram_alert(f"⚠️ *ARC Testnet Node Down Alert!*\nNode: `{url}` has failed {FAILURE_THRESHOLD} times consecutively.")
+        time.sleep(15)
 
-# =======================================================================
-# TELEGRAM BOT POLLING (BACKGROUND THREAD)
-# =======================================================================
-def telegram_polling():
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE": return
-    
-    # Clear any active webhooks to prevent 409 conflicts
-    try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=5)
-    except Exception:
-        pass
-
-    last_update_id = 0
+# ==========================================
+# TELEGRAM LISTENER WORKER (COMMANDS)
+# ==========================================
+def telegram_listener():
+    offset = 0
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=5"
-            resp = requests.get(url, timeout=10).json()
-            if resp.get("ok"):
-                for update in resp["result"]:
-                    last_update_id = update["update_id"]
-                    msg = update.get("message", {}).get("text", "").strip().lower()
-                    if msg in ["/status", "/start"]:
-                        status_text = "⚡ **ARC Testnet Status**\n\n"
-                        if global_node_data:
-                            for node, data in global_node_data.items():
-                                status_text += f"🔗 {node}\n📦 Block: {data['height']}\n⏱ Ping: {data['latency']}ms\n\n"
-                        else:
-                            status_text += "⚠️ Nodes initializing or temporarily offline.\n"
-                        send_telegram_message(status_text)
-            else:
-                emit_log(f"⚠️ Telegram API Warning: {resp}")
-        except Exception as e: 
-            emit_log(f"🔴 Telegram Polling Error: {str(e)}")
-        time.sleep(3)
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
+            resp = requests.get(url, timeout=35)
+            if resp.status_code == 200:
+                data = resp.json()
+                for result in data.get("result", []):
+                    offset = result["update_id"] + 1
+                    message = result.get("message", {})
+                    text = message.get("text", "").strip()
+                    chat_id = message.get("chat", {}).get("id")
+                    
+                    if chat_id and text:
+                        if text.startswith("/start"):
+                            reply = "⚡ *ARC Testnet Monitoring Sentinel is Online!*\n\nSend /status to check active node latencies and block heights."
+                            send_custom_message(chat_id, reply)
+                        elif text.startswith("/status"):
+                            reply = get_status_report()
+                            send_custom_message(chat_id, reply)
+        except Exception as e:
+            time.sleep(5)
+        time.sleep(1)
 
-def start_background_tasks():
-    init_db()
-    threading.Thread(target=telegram_polling, daemon=True).start()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(monitor_network())
-    except Exception:
-        pass
+# Start background threads
+threading.Thread(target=monitor_worker, daemon=True).start()
+threading.Thread(target=telegram_listener, daemon=True).start()
 
-# Safe Thread Startup
-if not any(t.name == "TestnetSentinelBackgroundThread" for t in threading.enumerate()):
-    bg_thread = threading.Thread(target=start_background_tasks, daemon=True, name="TestnetSentinelBackgroundThread")
-    bg_thread.start()
-
-# =======================================================================
-# FLASK WEB SERVER & API ROUTES
-# =======================================================================
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ARC Testnet Sentinel</title>
-    <style>
-        body { background-color: #050505; color: #ffcc00; font-family: 'Courier New', monospace; padding: 20px; font-size: 14px;}
-        .header { border-bottom: 1px solid #ffcc00; padding-bottom: 10px; margin-bottom: 15px;}
-        #console { white-space: pre-wrap; line-height: 1.5; color: #ffffff;}
-    </style>
-</head>
-<body>
-    <div class="header">
-        ⚡ ARC TESTNET SENTINEL INFRASTRUCTURE v3.1<br>
-        SYSTEM: API ACTIVE | PROXY LOAD BALANCER ACTIVE | DATABASE CONNECTED<br>
-    </div>
-    <div id="console">Booting core modules...<br></div>
-    <script>
-        const consoleDiv = document.getElementById('console');
-        const eventSource = new EventSource('/stream');
-        eventSource.onmessage = function(event) {
-            consoleDiv.innerHTML += event.data + "<br>";
-            window.scrollTo(0, document.body.scrollHeight);
-        };
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
+# ==========================================
+# WEB DASHBOARD (FLASK)
+# ==========================================
+@app.route("/")
 def index():
-    return HTML_TEMPLATE
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ARC Testnet Sentinel Dashboard</title>
+        <style>
+            body { background-color: #0d0d0d; color: #00ff66; font-family: monospace; padding: 20px; }
+            h2 { color: #ffcc00; border-bottom: 1px dashed #ffcc00; padding-bottom: 10px; }
+            pre { white-space: pre-wrap; word-wrap: break-word; font-size: 14px; line-height: 1.5; }
+        </style>
+    </head>
+    <body>
+        <h2>⚡ ARC TESTNET SENTINEL INFRASTRUCTURE v3.1</h2>
+        <p>SYSTEM: API ACTIVE | PROXY LOAD BALANCER ACTIVE | DATABASE CONNECTED</p>
+        <hr style="border-color: #333;">
+        <pre id="logs">Booting core modules...</pre>
+        <script>
+            const evtSource = new EventSource("/stream");
+            evtSource.onmessage = function(event) {
+                const logPre = document.getElementById("logs");
+                logPre.textContent += "\\n" + event.data;
+                window.scrollTo(0, document.getElementById("logs").scrollHeight);
+            };
+        </script>
+    </body>
+    </html>
+    """
+    return html
 
-@app.route('/stream')
+@app.route("/stream")
 def stream():
-    def generate_logs():
-        yield "data: System connected to live stream.\n\n"
+    def generate():
         while True:
             try:
-                msg = log_queue.get(timeout=5)
-                yield f"data: {msg}\n\n"
+                msg = log_queue.get(timeout=10)
+                yield f"data: {msg}\\n\\n"
             except queue.Empty:
-                yield "data: \n\n"
-            except Exception:
-                break
-    return Response(generate_logs(), mimetype='text/event-stream')
+                yield "data: [ heartbeat ]\\n\\n"
+    return Response(generate(), mimetype="text/event-stream")
 
-@app.route('/api/health', methods=['GET'])
-def api_health():
-    return jsonify({
-        "network": "Arc Testnet",
-        "timestamp": time.time(),
-        "active_nodes": len(global_node_data),
-        "nodes": global_node_data
-    })
-
-@app.route('/rpc', methods=['POST'])
-def proxy_balancer():
-    if not global_node_data:
-        return jsonify({"error": "No healthy testnet nodes available"}), 503
-    best_node = min(global_node_data.values(), key=lambda x: x['latency'])
-    try:
-        resp = requests.post(best_node['url'], json=request.json, timeout=5)
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        return jsonify({"error": "Proxy routing failed", "details": str(e)}), 502
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
