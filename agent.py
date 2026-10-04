@@ -19,8 +19,8 @@ FALLBACK_RPC_ENDPOINTS = [
 
 TELEGRAM_BOT_TOKEN = "8957473691:AAG6BgDwvyejUpEscgs9qcnGT-ddgtvrIEA"
 TELEGRAM_CHAT_ID = "8822300532"
-
-EXPECTED_CHAIN_ID = 5042002  # Arc testnet
+EXPECTED_CHAIN_ID = 5042002  # Arc testnet (mainnet is 5042)
+EXPLORER = "https://explorer.testnet.arc.io"
 FAILURE_THRESHOLD = 3
 COOLDOWN_SECONDS = 60
 MAX_DRIFT_THRESHOLD = 8
@@ -146,6 +146,12 @@ def fetch_gas(url):
         "erc20_usdc": (ERC20_GAS * gas_wei) / 1e18,
     }
 
+def fetch_tx_count(url):
+    block = rpc_call(url, "eth_getBlockByNumber", ["latest", False])
+    if not block:
+        return 0
+    return len(block.get("transactions") or [])
+
 def fetch_balance(url, address):
     raw = int(rpc_call(url, "eth_getBalance", [address, "latest"]), 16)
     return raw / 1e18
@@ -198,6 +204,7 @@ def get_status_report():
         status = data.get("status", "UNKNOWN")
         block = data.get("block", 0)
         latency = data.get("latency", 0)
+        txs = data.get("txs", 0)
         gas = data.get("gas") or {}
         emoji = "🟢" if status == "ONLINE" else "🔴"
         if status == "ONLINE" and block:
@@ -206,6 +213,7 @@ def get_status_report():
             f"{emoji} `{url}`\n"
             f"   • Status: *{status}*\n"
             f"   • Block: `{block}`\n"
+            f"   • Latest txs: `{txs}`\n"
             f"   • Latency: `{latency}ms`\n"
             f"   • Gas: `{gas.get('gwei', 'n/a')} gwei`\n"
             f"   • Native send: `{fmt_usdc(gas.get('native_usdc'))}`\n"
@@ -217,6 +225,7 @@ def get_status_report():
     sla = sla_percent(24)
     if sla is not None:
         report += f"📈 24h SLA: `{sla}%`\n"
+    report += f"🔗 Explorer: {EXPLORER}\n"
     if not global_node_data:
         report += "Initializing nodes, wait a few seconds..."
     return report
@@ -228,22 +237,23 @@ def get_gas_report():
     except Exception as e:
         return f"🔴 Gas fetch failed on `{url}`\n`{e}`"
     return (
-        "💵 *ARC USDC Gas*\n\n"
+        "💵 *ARC Testnet USDC Gas*\n\n"
         f"RPC: `{url}`\n"
         f"Suggested: `{gas['gwei']} gwei`\n"
         f"Base fee: `{gas['base_gwei']} gwei`\n"
         f"Native send (~21k): `{fmt_usdc(gas['native_usdc'])}`\n"
         f"ERC-20 transfer (~50k): `{fmt_usdc(gas['erc20_usdc'])}`\n\n"
-        "_Fees are USDC. Floor is ~20 gwei. Do not read this as ETH._"
+        "_Testnet fees, paid in test USDC. Do not read this as ETH._"
     )
 
 HELP_TEXT = (
     "⚡ *ARC Testnet Sentinel*\n\n"
-    "/status — nodes, block, latency, USDC gas\n"
+    "/status — nodes, block, txs, latency, USDC gas\n"
     "/gas — live USDC fee estimate\n"
     "/drift — block gap across RPCs\n"
     "/chain — chain id check (5042002)\n"
     "/peers — net peer count\n"
+    "/txs — latest block transaction count\n"
     "/bal 0x... — native USDC balance\n"
     "/watch 0x... — balance watch\n"
     "/unwatch 0x... — remove watch\n"
@@ -268,13 +278,24 @@ def monitor_worker():
                 latency = int((time.time() - start_time) * 1000)
                 block_height = int(block_hex, 16)
                 gas = {}
+                txs = 0
                 try:
                     gas = fetch_gas(url)
                 except Exception as ge:
                     log_msg(f"[!] Gas read failed {url}: {ge}")
-                log_msg(f"🟢 [ONLINE] {url} | Block: {block_height} | Ping: {latency}ms | Gas: {gas.get('gwei')} gwei")
+                try:
+                    txs = fetch_tx_count(url)
+                except Exception as te:
+                    log_msg(f"[!] Tx count failed {url}: {te}")
+                log_msg(
+                    f"🟢 [ONLINE] {url} | Block: {block_height} | Txs: {txs} | "
+                    f"Ping: {latency}ms | Gas: {gas.get('gwei')} gwei"
+                )
                 if rpc_status[url]["alerted"]:
-                    send_telegram_alert(f"✅ *Node recovered*\n`{url}` is ONLINE at block `{block_height}`.")
+                    send_telegram_alert(
+                        f"✅ *Testnet node recovered*\n`{url}` is ONLINE at block `{block_height}` "
+                        f"({txs} txs)."
+                    )
                 rpc_status[url]["failures"] = 0
                 rpc_status[url]["alerted"] = False
                 rpc_status[url]["circuit_broken_until"] = 0
@@ -282,13 +303,14 @@ def monitor_worker():
                     "status": "ONLINE",
                     "latency": latency,
                     "block": block_height,
+                    "txs": txs,
                     "gas": gas,
                 }
                 log_to_db(url, "ONLINE", latency, block_height)
                 online_blocks.append(block_height)
                 if gas.get("gwei", 0) >= GAS_ALERT_THRESHOLD_GWEI:
                     send_telegram_alert(
-                        f"💸 *High USDC gas*\n`{url}` at `{gas['gwei']} gwei` "
+                        f"💸 *High USDC gas (testnet)*\n`{url}` at `{gas['gwei']} gwei` "
                         f"(ERC-20 ~ {fmt_usdc(gas.get('erc20_usdc'))})"
                     )
                 if latency >= HIGH_LATENCY_THRESHOLD_MS:
@@ -297,19 +319,25 @@ def monitor_worker():
                 latency = int((time.time() - start_time) * 1000)
                 log_msg(f"🔴 [OFFLINE] {url} | Error: {e}")
                 rpc_status[url]["failures"] += 1
-                global_node_data[url] = {"status": "OFFLINE", "latency": latency, "block": 0, "gas": {}}
+                global_node_data[url] = {
+                    "status": "OFFLINE",
+                    "latency": latency,
+                    "block": 0,
+                    "txs": 0,
+                    "gas": {},
+                }
                 log_to_db(url, "OFFLINE", latency, 0)
                 if rpc_status[url]["failures"] >= FAILURE_THRESHOLD and not rpc_status[url]["alerted"]:
                     rpc_status[url]["alerted"] = True
                     rpc_status[url]["circuit_broken_until"] = time.time() + COOLDOWN_SECONDS
                     send_telegram_alert(
-                        f"⚠️ *ARC node down*\n`{url}` failed {FAILURE_THRESHOLD} times. "
+                        f"⚠️ *ARC testnet node down*\n`{url}` failed {FAILURE_THRESHOLD} times. "
                         f"Cooling off {COOLDOWN_SECONDS}s."
                     )
         if len(online_blocks) >= 2:
             drift = max(online_blocks) - min(online_blocks)
             if drift > MAX_DRIFT_THRESHOLD:
-                send_telegram_alert(f"📏 *Block drift*\nGap `{drift}` blocks across RPCs.")
+                send_telegram_alert(f"📏 *Block drift*\nGap `{drift}` blocks across testnet RPCs.")
         for address in list(watch_addresses):
             try:
                 bal = fetch_balance(healthy_url(), address)
@@ -349,6 +377,17 @@ def handle_command(chat_id, text):
             send_custom_message(chat_id, f"🔗 Peers: `{peers}`")
         except Exception as e:
             send_custom_message(chat_id, f"Peer count failed: `{e}`")
+    elif cmd == "/txs":
+        try:
+            url = healthy_url()
+            txs = fetch_tx_count(url)
+            block = global_node_data.get(url, {}).get("block", 0)
+            send_custom_message(
+                chat_id,
+                f"🧾 Latest block `{block}` on `{url}` has `{txs}` transactions.",
+            )
+        except Exception as e:
+            send_custom_message(chat_id, f"Tx count failed: `{e}`")
     elif cmd == "/bal" and len(parts) > 1:
         address = parts[1]
         try:
@@ -424,7 +463,7 @@ def index():
     </head>
     <body>
         <h2>ARC Testnet Sentinel</h2>
-        <p class="muted">USDC gas · drift · SLA · one-shot alerts</p>
+        <p class="muted">USDC gas · txs · drift · SLA · chain 5042002</p>
         <pre id="logs">Booting core modules...</pre>
         <script>
             const evtSource = new EventSource("/stream");
@@ -445,14 +484,28 @@ def stream():
         while True:
             try:
                 msg = log_queue.get(timeout=10)
-                yield f"data: {msg}\\n\\n"
+                yield f"data: {msg}\n\n"
             except queue.Empty:
-                yield "data: [ heartbeat ]\\n\\n"
-    return Response(generate(), mimetype="text/event-stream")
+                yield "data: [ heartbeat ]\n\n"
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({"nodes": global_node_data, "sla_24h": sla_percent(24), "watch": watch_addresses})
+    return jsonify({
+        "network": "arc-testnet",
+        "chain_id": EXPECTED_CHAIN_ID,
+        "nodes": global_node_data,
+        "sla_24h": sla_percent(24),
+        "watch": watch_addresses,
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
