@@ -9,15 +9,15 @@ Arc prices gas in USDC (18 decimals), not a volatile native token. This service 
 
 ## Live dashboard
 
-Hosted instance:
+Open this in Chrome to run the agent:
 
-**https://arc-testnet-agent.onrender.com**
+**https://arc-testnet-agent-uixx.onrender.com/**
 
 | Endpoint | URL |
 | --- | --- |
-| Dashboard | https://arc-testnet-agent.onrender.com |
-| JSON status | https://arc-testnet-agent.onrender.com/api/status |
-| Log stream | https://arc-testnet-agent.onrender.com/stream |
+| Dashboard | https://arc-testnet-agent-uixx.onrender.com/ |
+| JSON status | https://arc-testnet-agent-uixx.onrender.com/api/status |
+| Log stream | https://arc-testnet-agent-uixx.onrender.com/stream |
 
 The free Render instance sleeps after inactivity. The first request can take up to a minute while the process wakes.
 
