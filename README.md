@@ -25,6 +25,8 @@ The free Render instance sleeps after inactivity. The first request can take up 
 
 Same monitor, over Telegram. Alerts cover node outages, recovery, high latency, high USDC gas, and block drift.
 
+**Bot:** [ArcTestnetMonitorBot](https://t.me/ArcTestnetMonitorBot)
+
 Send `/help` to the bot. The bot token and chat ID are set as environment variables on Render. They are not stored in this repository.
 
 | Command | Description |
